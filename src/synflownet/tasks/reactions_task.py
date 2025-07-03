@@ -359,7 +359,7 @@ def main(args):
         config.log_dir = f"./logs/debug_run_reactions_task_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
         config.device = "cuda" if torch.cuda.is_available() else "cpu"
         config.overwrite_existing_exp = True
-        config.num_training_steps = round(molscore_cfg.total_smiles / 50) # Somewhere batch size is set to 50. Old default: 5000
+        config.num_training_steps = round(molscore_cfg.total_smiles / 64) # Somewhere batch size is set to 64. Old default: 5000
         config.validate_every = 5000
         config.num_final_gen_steps = 0
         config.num_workers = 0
