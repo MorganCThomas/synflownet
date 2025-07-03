@@ -4,6 +4,8 @@ import os
 import pickle
 import shutil
 import socket
+import functools
+from pathlib import Path
 from typing import Callable, Dict, List, Tuple, Union
 
 import numpy as np
@@ -30,6 +32,9 @@ from synflownet.utils.conditioning import TemperatureConditional
 from synflownet.utils.gpu_vina import QuickVina2GPU
 from synflownet.utils.misc import get_worker_device
 from synflownet.utils.transforms import to_logreward
+
+from molscore import MolScore, MolScoreBenchmark, MolScoreCurriculum
+from .....common.utils import load_config, save_config
 
 # Write any local overrides required here
 LOCAL_OVERRIDES = "local_overrides.yaml"
@@ -319,15 +324,16 @@ class ReactionTrainer(StandardOnlineTrainer):
         return {"murcko_scaffolds": UniqueMurckoScaffoldsCallback(reward_thresh=0.5)}
 
 
-def main(wandb_run_name, backoff=False):
+def main(args):
     """Example of how this trainer can be run"""
 
     name = None
     checkpoint_path = None
-    if backoff:
-        assert wandb_run_name is not None
+    molscore_cfg = load_config(args.molscore_config)
+    if args.backoff:
+        assert args.wandb_run_name is not None
         logroot = "./logs"
-        logdirs = [d for d in os.listdir(logroot) if d.startswith(wandb_run_name)]
+        logdirs = [d for d in os.listdir(logroot) if d.startswith(args.wandb_run_name)]
         if len(logdirs) > 0:
             name = sorted(logdirs)[0]
             checkpoint_path = os.path.join(logroot, name, "model_state.pt")
@@ -336,8 +342,8 @@ def main(wandb_run_name, backoff=False):
 
     if name is None and checkpoint_path is None:
         now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        if wandb_run_name is not None:
-            name = f"{wandb_run_name}_{now}"
+        if args.wandb_run_name is not None:
+            name = f"{args.wandb_run_name}_{now}"
             wandb.init(project="synflownet", name=name, id=name)
         else:
             name = f"debug_{now}"
@@ -353,9 +359,9 @@ def main(wandb_run_name, backoff=False):
         config.log_dir = f"./logs/debug_run_reactions_task_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
         config.device = "cuda" if torch.cuda.is_available() else "cpu"
         config.overwrite_existing_exp = True
-        config.num_training_steps = 5000
-        config.validate_every = 500
-        config.num_final_gen_steps = 100
+        config.num_training_steps = round(molscore_cfg.total_smiles / 50) # Somewhere batch size is set to 50. Old default: 5000
+        config.validate_every = 5000
+        config.num_final_gen_steps = 0
         config.num_workers = 0
         config.opt.learning_rate = 1e-4
         config.opt.lr_decay = 2_000
@@ -364,6 +370,8 @@ def main(wandb_run_name, backoff=False):
         config.cond.temperature.dist_params = [32.0]
         config.model.graph_transformer.continuous_action_embs = True
         config.model.graph_transformer.fingerprint_type = "morgan_1024"
+        # Set seed through args
+        config.seed = args.seed
 
         # For Vina experiments
         config.vina.target = "kras"
@@ -394,12 +402,82 @@ def main(wandb_run_name, backoff=False):
         config.algo.tb.do_correct_idempotent = False
 
         trial = ReactionTrainer(config)
-    trial.run()
+        
+    # ---- Run using MolScore ----
+    
+    def task_patch(molscore_task):
+        """Monkey patch the task to use the ReactionTask"""
+        def compute_molscore_reward(self, graphs: List[gd.Data], mols: List[Chem.Mol], traj_lens: Tensor) -> Tensor:
+            """Compute the reward for the given molecules."""
+            smiles = [Chem.MolToSmiles(mol) for mol in mols]
+            rewards = molscore_task(smiles)
+            # Transform from [0, 1] to [0, 100]
+            rewards = rewards * 100
+            return torch.tensor(rewards).float().clip(1e-4, 100)
+        return functools.partial(compute_molscore_reward, self=trial.task)
+    
+    # Single mode
+    if molscore_cfg.molscore_mode == "single":
+        task = MolScore(
+            model_name=molscore_cfg.model_name,
+            task_config=molscore_cfg.molscore_task,
+            budget=molscore_cfg.total_smiles,
+            output_dir=molscore_cfg.output_dir,
+            add_run_dir=True,
+            **molscore_cfg.get("molscore_kwargs", {}),
+        )
+        # Save configs
+        save_config(vars(args), Path(task.save_dir) / "args.yaml")
+        save_config(molscore_cfg, Path(task.save_dir) / "molscore_args.yaml")
+        with task as scorer:
+            trial.task.compute_reward_from_graph = task_patch(scorer)
+            trial.run()
+        
+    # Benchmark mode
+    if molscore_cfg.molscore_mode == "benchmark":
+        MSB = MolScoreBenchmark(
+            model_name=molscore_cfg.model_name,
+            benchmark=molscore_cfg.molscore_task,
+            budget=molscore_cfg.total_smiles,
+            output_dir=molscore_cfg.output_dir,
+            add_benchmark_dir=True,
+            **molscore_cfg.get("molscore_kwargs", {}),
+        )
+        # Save configs
+        save_config(vars(args), Path(MSB.output_dir) / "args.yaml")
+        save_config(molscore_cfg, Path(MSB.output_dir) / "molscore_args.yaml")
+        with MSB as benchmark:
+            for task in benchmark:
+                with task as scorer:
+                    trial.task.compute_reward_from_graph = task_patch(scorer)
+                    trial.run()
+                
+    # Curriculum mode
+    if molscore_cfg.molscore_mode == "curriculum":
+        task = MolScoreCurriculum(
+            model_name=molscore_cfg.model_name,
+            benchmark=molscore_cfg.molscore_task,
+            budget=molscore_cfg.total_smiles,
+            output_dir=molscore_cfg.output_dir,
+            **molscore_cfg.get("molscore_kwargs", {}),
+        )
+        # Save configs
+        save_config(vars(args), Path(task.save_dir) / "args.yaml")
+        save_config(molscore_cfg, Path(task.save_dir) / "molscore_args.yaml")
+        with task as scorer:
+            trial.task.compute_reward_from_graph = task_patch(scorer)
+            trial.run()
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--wandb_run_name", type=str, required=False, default=None)
     p.add_argument("--backoff", action="store_true", required=False, default=False)
+    p.add_argument('--molscore_config', type=str, required=True, 
+                        help='Path to the MolScore configuration file')
+    p.add_argument('--seed', type=int, default=42,
+                        help='Random seed for reproducibility')
+    p.add_argument('--n_jobs', type=int, default=1,
+                        help='Number of parallel jobs to run')
     args = p.parse_args()
-    main(args.wandb_run_name, args.backoff)
+    main(args)
